@@ -1059,4 +1059,11 @@ describe("what ships", () => {
     }
   });
 
+  it("brackets IPv6 hosts and maps :: to 127.0.0.1 for publicUrl", () => {
+    const cfgLoopback = loadConfig({ CONCORD_HOST: "::1", CONCORD_PORT: "4400" });
+    expect(cfgLoopback.publicUrl).toBe("http://[::1]:4400");
+
+    const cfgAny = loadConfig({ CONCORD_HOST: "::", CONCORD_PORT: "4400" });
+    expect(cfgAny.publicUrl).toBe("http://127.0.0.1:4400");
+  });
 });
