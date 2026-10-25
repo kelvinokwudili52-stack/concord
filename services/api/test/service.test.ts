@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import Ajv from "ajv";
 import { nativeToScVal } from "@stellar/stellar-sdk";
 import { beforeEach, describe, expect, it } from "vitest";
-import { decodeEvent, StellarSource } from "../src/chain.js";
+import { ChainError, StellarSource, cursorLedger, decodeEvent } from "../src/chain.js";
 import { USAGE } from "../src/cli-usage.js";
 import { Concord, Invalid, NotFound } from "../src/concord.js";
 import { Db } from "../src/db.js";
@@ -79,6 +79,36 @@ describe("decodeEvent", () => {
     expect(decodeEvent(invalidDateRaw)).toBeUndefined();
   });
 
+  it("rejects negative amounts and accepts zero amounts for transfer, mint, burn, and clawback", () => {
+    // transfer
+    expect(decodeEvent(raw([sym("transfer"), addr(a), addr(b), str(`FUND:${a}`)], i128(-5n)))).toBeUndefined();
+    expect(decodeEvent(raw([sym("transfer"), addr(a), addr(b), str(`FUND:${a}`)], i128(0n)))).toMatchObject({
+      kind: "transfer",
+      amount: 0n,
+    });
+
+    // mint
+    expect(decodeEvent(raw([sym("mint"), addr(b), str(`FUND:${a}`)], i128(-5n)))).toBeUndefined();
+    expect(decodeEvent(raw([sym("mint"), addr(b), str(`FUND:${a}`)], i128(0n)))).toMatchObject({
+      kind: "mint",
+      amount: 0n,
+    });
+
+    // burn
+    expect(decodeEvent(raw([sym("burn"), addr(b), str(`FUND:${a}`)], i128(-5n)))).toBeUndefined();
+    expect(decodeEvent(raw([sym("burn"), addr(b), str(`FUND:${a}`)], i128(0n)))).toMatchObject({
+      kind: "burn",
+      amount: 0n,
+    });
+
+    // clawback
+    expect(decodeEvent(raw([sym("clawback"), addr(b), str(`FUND:${a}`)], i128(-5n)))).toBeUndefined();
+    expect(decodeEvent(raw([sym("clawback"), addr(b), str(`FUND:${a}`)], i128(0n)))).toMatchObject({
+      kind: "clawback",
+      amount: 0n,
+    });
+  });
+
   it("returns undefined without throwing when topic or value contains malformed XDR", () => {
     // Malformed topic (not valid base64 / ScVal)
     const badTopicRaw = {
@@ -97,6 +127,8 @@ describe("decodeEvent", () => {
 
   it("skips malformed events and returns the remaining good events in getEvents", async () => {
     const goodRaw = raw([sym("transfer"), addr(a), addr(b), str(`FUND:${a}`)], i128(5n));
+    // A kind Concord does not track is ignored, not malformed.
+    const ignoredRaw = raw([sym("approve"), addr(a), addr(b), str(`FUND:${a}`)], i128(1n));
     const badRaw = {
       ...raw(["!!!notxdr", addr(a), addr(b), str(`FUND:${a}`)], i128(5n)),
       id: "0000000429496729600-0000000002",
@@ -114,7 +146,7 @@ describe("decodeEvent", () => {
             jsonrpc: "2.0",
             id: 1,
             result: {
-              events: [badRaw, goodRaw],
+              events: [badRaw, ignoredRaw, goodRaw],
               latestLedger: 100,
               cursor: "cursor-1",
             },
@@ -133,6 +165,31 @@ describe("decodeEvent", () => {
     expect(page.latestLedger).toBe(100);
     expect(page.cursor).toBe("cursor-1");
   });
+});
+
+describe("cursorLedger", () => {
+  it("decodes valid TOID cursors with or without index", () => {
+    // 100 << 32 = 429496729600n
+    expect(cursorLedger("429496729600-0000000001")).toBe(100);
+    expect(cursorLedger("429496729600-1")).toBe(100);
+    expect(cursorLedger("429496729600")).toBe(100);
+  });
+
+  const invalidCases = [
+    { label: "empty string", input: "" },
+    { label: "negative number", input: "-5" },
+    { label: "non-numeric string", input: "abc-1" },
+    { label: "invalid characters", input: "123a-45" },
+    { label: "multiple hyphens", input: "123-45-67" },
+    { label: "trailing hyphen", input: "123-" },
+  ];
+
+  for (const { label, input } of invalidCases) {
+    it(`throws ChainError on ${label} (${JSON.stringify(input)})`, () => {
+      expect(() => cursorLedger(input)).toThrow(ChainError);
+      expect(() => cursorLedger(input)).toThrow(/invalid cursor/);
+    });
+  }
 });
 
 describe("Concord", () => {
@@ -289,6 +346,24 @@ describe("Concord", () => {
     expect((await concord.reconcileAction(split.id)).state).toBe("clean");
   });
 
+  it("reconciles reverse splits executed as burns rather than clawbacks", async () => {
+    chain.push(assetId, "burn", 7, { from: h1, amount: u(50) });
+    chain.push(assetId, "burn", 7, { from: h2, amount: u(25) });
+    const split = await concord.createAction("FUND", {
+      type: "split",
+      recordTime: at(5),
+      windowTo: at(9),
+      num: "1",
+      den: "2",
+    });
+    expect(split.state).toBe("clean");
+    expect(split.result?.summary).toMatchObject({
+      expectedTotal: "-75",
+      observedTotal: "-75",
+      breakCount: 0,
+    });
+  });
+
   it("rejects non-address payer and warns on a silent payer", async () => {
     await expect(
       concord.createAction("FUND", {
@@ -346,6 +421,28 @@ describe("Concord", () => {
     expect(action.result!.warnings).toEqual([
       expect.stringContaining("earlier than history start"),
     ]);
+
+    // reconcile() on OLD with asOf earlier than history start (e.g. at(5)) carries warning
+    const regEarly = concord.importRegister("OLD", {
+      csv: `holder_id,account,units\nA,${h1},70\n`,
+      asOf: at(5),
+    });
+    const runEarly = await concord.reconcile("OLD", regEarly.registerId);
+    expect(runEarly.warnings).toEqual([
+      expect.stringContaining("earlier than history start"),
+    ]);
+
+    // holdings() on OLD with asOf earlier than history start carries beforeHistory flag and warning
+    const holdingsEarly = concord.holdings("OLD", at(5));
+    expect(holdingsEarly.beforeHistory).toBe(true);
+    expect(holdingsEarly.warnings).toEqual([
+      expect.stringContaining("earlier than history start"),
+    ]);
+
+    // holdings() with asOf after history start has beforeHistory: false and empty warnings
+    const holdingsNormal = concord.holdings("OLD", at(160));
+    expect(holdingsNormal.beforeHistory).toBe(false);
+    expect(holdingsNormal.warnings).toEqual([]);
   });
 
   it("builds the controls log and the audit pack", async () => {
@@ -626,6 +723,19 @@ describe("Concord", () => {
     expect(healed.syncError).toBeUndefined();
   });
 
+  it("reports an unreadable saved cursor instead of a parse error or a skipped gap check", async () => {
+    const db = new Db(":memory:");
+    const damaged = new Concord(db, { testnet: { passphrase: PASSPHRASE, chain } });
+    const watched = await damaged.watchAsset({ network: "testnet", asset: `DMG:${issuer}`, fromLedger: 1 });
+    await damaged.sync(watched.id);
+    // An empty cursor reads as "no cursor", so only non-empty junk counts as damage.
+    for (const cursor of ["-5", "abc-1", "123-"]) {
+      db.write("UPDATE assets SET cursor = ? WHERE id = ?", cursor, watched.id);
+      await expect(damaged.sync(watched.id)).rejects.toThrow(/saved indexing position is unreadable/);
+      expect(damaged.asset(watched.id).syncError).toMatch(/Rebuild this asset/);
+    }
+  });
+
   it("reports a gap instead of indexing across it", async () => {
     await concord.sync("FUND");
     chain.latest = 500_000;
@@ -713,6 +823,37 @@ describe("Concord", () => {
     ).rejects.toThrow(new Invalid("decimals must be 0 to 18"));
   });
 
+  it("validates Stellar addresses in ignore and exclude lists", async () => {
+    const validG = key();
+    const validC = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+    const validM = "MAAAAAAAAAAAJRU2"; // valid med25519 or test med25519
+    const invalidAddr = "not-an-address";
+
+    // watchAsset rejects invalid address and names it
+    await expect(
+      concord.watchAsset({ network: "testnet", asset: `BAD1:${key()}`, fromLedger: 1, ignore: [invalidAddr] }),
+    ).rejects.toThrow(`ignore contains an invalid Stellar address: "${invalidAddr}"`);
+
+    // watchAsset accepts valid G and C addresses
+    const watched = await concord.watchAsset({ network: "testnet", asset: `GOOD:${key()}`, fromLedger: 1, ignore: [validG, validC] });
+    expect(watched.ignore).toEqual([validG, validC]);
+
+    // updateAsset rejects invalid address and names it
+    expect(() => concord.updateAsset(watched.id, { ignore: [invalidAddr] })).toThrow(
+      `ignore contains an invalid Stellar address: "${invalidAddr}"`,
+    );
+
+    // createAction rejects invalid address in exclude and names it
+    await expect(
+      concord.createAction(watched.id, {
+        type: "split",
+        recordTime: at(10),
+        num: "2",
+        den: "1",
+        exclude: [invalidAddr],
+      }),
+    ).rejects.toThrow(`exclude contains an invalid Stellar address: "${invalidAddr}"`);
+  });
   it("serves the same operations over HTTP, to a signed-in user", async () => {
     const h = harness();
     h.chain.baselineResult = { ledger: 50, openings: new Map() };
